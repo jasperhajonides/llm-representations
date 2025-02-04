@@ -2,46 +2,32 @@ import os
 import pickle
 import numpy as np
 import matplotlib.pyplot as plt
-from typing import List, Union, Optional
+from typing import List, Union, Optional, Dict
 from tqdm import tqdm
 
 # For embeddings
 import openai
+import cohere
+import google.generativeai as genai
 from openai import OpenAI
 from transformers import AutoTokenizer, AutoModel
 import torch
 from sklearn.manifold import MDS
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.decomposition import PCA
 
 
 class MDSProjector:
     """
     A class that orchestrates sentence generation, embedding retrieval, MDS projection, and result plotting.
-    Designed for both numeric (1–10) and categorical (bad, not good, ...) rating scales.
-    
-    Example Usage:
-    --------------
-    >>> concepts = ["judging beauty", "rating spiciness"]
-    >>> mds_proj = MDSProjector(api_key="YOUR_OPENAI_API_KEY")
-    >>> sentences = mds_proj.generate_sentences(concepts, categorical=False)
-    >>> embeddings = mds_proj.get_embeddings(sentences, model_name="text-embedding-3-small")
-    >>> points_2d = mds_proj.apply_mds(embeddings)
-    >>> mds_proj.plot_2d(points_2d, labels=[s['score'] for s in sentences])
+    Designed for both numeric (1–10) and categorical rating scales.
     """
 
     def __init__(self, api_key: Optional[str] = None):
-        """
-        Initialize the MDSProjector.
+        self.api_key = api_key  # for OpenAI or others
+        self.scores = list(range(1, 11))  # default numeric scores
 
-        Parameters
-        ----------
-        api_key : str, optional
-            API key for services like OpenAI, Voyage, etc.
-        """
-        self.api_key = api_key  # Store for use in embedding methods
-        self.scores = list(range(1, 11))  # Default numerical scores
-    
     def generate_sentences(
         self, 
         concepts: List[str], 
@@ -51,43 +37,27 @@ class MDSProjector:
         """
         Generates multiple sentences for each concept with phrasing variations.
         Supports both categorical and numerical scoring systems.
-    
-        Parameters
-        ----------
-        concepts : List[str]
-            List of concept topics.
-        categorical : bool, default=False
-            If True, uses categorical labels instead of numerical scores.
-        num_phrasings : int, default=10
-            Number of phrasing variations to include.
-    
-        Returns
-        -------
-        List[dict]
-            Each dictionary contains 'concept', 'score', 'text', and 'phrasing'.
         """
         if categorical:
-            self.scores = ["abysmal", "terrible", "dreadful", "inadequate", "mediocre", "decent", "acceptable",  "good", "great", "excellent",
-                           "superb", "magnificent", "perfect"]
-            self.scores = [ "F", "D−", "D", "D+","C−", "C", "C+", "B−", "B", "B+","A−","A","A+"]
-            # self.scores = [f'{i}%' for i in range(10,101,10)]
-            
+            # self.scores = [ "F", "D−", "D", ... "A+" ] (whatever you want)
+            # self.scores = [ "F", "D−", "D", "D+","C−", "C", "C+", "B−", "B", "B+","A−","A","A+"]
+            self.scores = ["dreadful", "terrible","inadequate", "mediocre", "acceptable", 
+            "decent", "good", "great", "excellent", "superb", "magnificent", "perfect"]
             phrasings = [
                 lambda concept, score: f"We are {concept}, my evaluation is {score}",
                 lambda concept, score: f"Rated as {score} after {concept}",
-                lambda concept, score: f"After {concept}, receiving a {score} rating",
+                lambda concept, score: f"After {concept}, receiving a(n) {score} rating",
                 lambda concept, score: f"On the topic of {concept}, my score is {score}",
-                lambda concept, score: f"{concept.capitalize()} gets a rating of {score}",
-                lambda concept, score: f"My {concept} judgement is {score}",
+                lambda concept, score: f"{concept.capitalize()} gets rated as {score}",
+                lambda concept, score: f"On {concept}, judgement is that its {score}",
                 lambda concept, score: f"{concept.capitalize()} is evaluated as {score}",
                 lambda concept, score: f"The rating for {concept} is {score}",
                 lambda concept, score: f"{concept.capitalize()} scores as {score}",
                 lambda concept, score: f"In terms of {concept}, my score is {score}",
             ][:num_phrasings]
         else:
-            
-            # Or with list comprehension
-            self.scores = range(1, 11,1)
+            # Numeric scale
+            self.scores = list(range(1, 11))  # 1..10 or 1..10 step=1
             max_score = max(self.scores)
             phrasings = [
                 lambda concept, score: f"We are {concept} on a scale of 1 to {max_score}, my score is {score}",
@@ -115,26 +85,9 @@ class MDSProjector:
                     })
         return all_sentences
 
-
-    def get_embeddings(self, sentences: List[Union[str, dict]], 
-                       model_name: str,
-                      OPENAI_APIKEY: str) -> np.ndarray:
+    def get_embeddings(self, sentences: List[Union[str, dict]], model_name: str, OPENAI_APIKEY: str) -> np.ndarray:
         """
-        Obtain embeddings for a list of sentences from various models (OpenAI, HF, Voyage, etc.).
-
-        Parameters
-        ----------
-        sentences : list of (str or dict)
-            If dict, must contain 'text' key. Otherwise, each is a raw string.
-        model_name : str
-            Identifier for the embedding model (e.g. "text-embedding-3-small", "sentence-transformers/all-MiniLM-L6-v2", etc.).
-        OPENAI_APIKEY: str
-            api key for openai
-        
-        Returns
-        -------
-        embeddings : np.ndarray of shape (N, D)
-            Where N is the number of sentences, and D is the embedding dimension.
+        Obtain embeddings for a list of sentences from various models (OpenAI, HF, etc.).
         """
         # Extract plain strings if needed
         texts = [s['text'] if isinstance(s, dict) else s for s in sentences]
@@ -146,6 +99,10 @@ class MDSProjector:
             return self._get_voyage_embeddings(texts, model_name)
         elif model_name.startswith("claude"):
             return self._get_claude_embeddings(texts, model_name)
+        elif model_name.startswith("cohere"):
+            return self._get_cohere_embeddings(texts, model_name.split('/')[-1])
+        elif model_name.startswith("gemini"):
+            return self._get_gemini_embeddings(texts, model_name.split('/', 1)[-1])
         else:
             return self._get_hf_embeddings(texts, model_name)
 
@@ -176,21 +133,93 @@ class MDSProjector:
 
         return np.array(embeddings, dtype=np.float32)
 
+
+
+    def _get_cohere_embeddings(self, texts: List[str], model_name: str) -> np.ndarray:
+        """
+        Retrieve embeddings from Cohere in a sequential fashion (one text at a time).
+        
+        Parameters:
+        - texts: List of input strings to embed.
+        - model_name: Name of the Cohere embedding model.
+        
+        Returns:
+        - np.ndarray: A NumPy array of shape (num_texts, embedding_dim).
+        """
+        import time
+        # Initialize Cohere client
+        co = cohere.ClientV2(api_key=os.getenv("APIKEY_COHERE"))
+
+        embeddings = []
+        
+        for txt in tqdm(texts, desc=f"Fetching Cohere ({model_name}) embeddings"):
+            try:
+                response = co.embed(
+                    texts=[txt],  # Process one text at a time
+                    model=model_name,
+                    input_type="classification",
+                    embedding_types=["float"],
+                )
+
+                emb = response.embeddings  # Extract embeddings
+                
+                # Ensure proper unwrapping if wrapped in `float_`
+                if hasattr(emb, "float_"):
+                    emb = emb.float_
+
+                embeddings.append(emb[0])  # Extract the first (and only) embedding
+                time.sleep(0.7)
+            except Exception as e:
+                print(f"Error for '{txt[:50]}...': {e}")
+                # Use zero vector matching the expected dimension (assume 1024)
+                dim = 1024  # Adjust if needed
+                embeddings.append([0.0] * dim)
+
+        return np.array(embeddings, dtype=np.float32)
+
+    def _get_gemini_embeddings(self, texts: List[str], model_name: str) -> np.ndarray:
+        """
+        Retrieve embeddings from Google's Gemini API in a sequential fashion.
+        
+        Parameters:
+        - texts: List of input strings to embed.
+        - model_name: Name of the Gemini embedding model (e.g., "models/text-embedding-004").
+        
+        Returns:
+        - np.ndarray: A NumPy array of shape (num_texts, embedding_dim).
+        """
+        # Configure the API key
+        genai.configure(api_key=os.getenv("APIKEY_GEMINI"))
+
+        embeddings = []
+        
+        for txt in tqdm(texts, desc=f"Fetching Gemini ({model_name}) embeddings"):
+            try:
+                response = genai.embed_content(
+                    model=model_name,
+                    content=txt
+                )
+                
+                emb = response['embedding']  # Extract the embedding
+
+                embeddings.append(emb)  # Append the embedding
+
+            except Exception as e:
+                print(f"Error for '{txt[:50]}...': {e}")
+                # Use zero vector matching the expected dimension (assume 768, adjust as needed)
+                dim = 768  
+                embeddings.append([0.0] * dim)
+
+        return np.array(embeddings, dtype=np.float32)
+
+
     def _get_voyage_embeddings(self, texts: List[str], model_name: str) -> np.ndarray:
         """
         Retrieve embeddings from Voyage (pseudo-code).
         """
-        # import voyageai  # would require an actual import
         if not self.api_key:
             raise ValueError("Voyage API key is not provided.")
-
-        print(f"Mock embedding call for Voyage model: {model_name}")
-        # Pseudo-code if voyageai.Client is used
-        # vo = voyageai.Client(api_key=self.api_key)
-        # result = vo.embed(texts, model=model_name, input_type="document")
-        # return np.array(result.embeddings, dtype=np.float32)
-
-        # For demonstration, return random vectors:
+        # For demonstration, return random
         return np.random.rand(len(texts), 1024).astype(np.float32)
 
     def _get_claude_embeddings(self, texts: List[str], model_name: str) -> np.ndarray:
@@ -199,10 +228,7 @@ class MDSProjector:
         """
         if not self.api_key:
             raise ValueError("Anthropic/Claude API key is not provided.")
-
-        print(f"Mock embedding call for Claude model: {model_name}")
-        # Actual implementation would use Anthropic's library or endpoints
-        # For demonstration, return random vectors:
+        # For demonstration, return random
         return np.random.rand(len(texts), 768).astype(np.float32)
 
     def _get_hf_embeddings(self, texts: List[str], model_name: str) -> np.ndarray:
@@ -219,7 +245,6 @@ class MDSProjector:
         model.to(device).eval()
 
         embeddings = []
-        from tqdm import tqdm  # local import
         for txt in tqdm(texts, desc=f"Fetching HF ({model_name}) embeddings"):
             try:
                 inputs = tokenizer(txt, return_tensors="pt", padding=True, truncation=True).to(device)
@@ -234,24 +259,111 @@ class MDSProjector:
 
         return np.array(embeddings, dtype=np.float32)
 
-    @staticmethod
-    def save_embeddings(embeddings: np.ndarray, filepath: str = "embeddings.pkl") -> None:
+    def save_embeddings(self, embeddings: np.ndarray, filepath: str = "embeddings.pkl") -> None:
         """
-        Saves embeddings to a local file.
+        Old method that saves *only* the raw embeddings.
         """
         with open(filepath, "wb") as f:
             pickle.dump(embeddings, f)
 
-    @staticmethod
-    def load_embeddings(filepath: str = "embeddings.pkl") -> np.ndarray:
+    def load_embeddings(self, filepath: str = "embeddings.pkl") -> np.ndarray:
         """
-        Loads embeddings from a local file.
+        Old method that loads *only* the raw embeddings.
         """
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"Embedding file not found: {filepath}")
 
         with open(filepath, "rb") as f:
             return pickle.load(f)
+
+    ##
+    ## NEW METHODS FOR STORING/LOADING FULL CONFIG + EMBEDDINGS
+    ##
+
+    def save_data(self, data: Dict, filepath: str) -> None:
+        """
+        Saves an entire dictionary (e.g. with embeddings + config + sentences).
+        """
+        with open(filepath, "wb") as f:
+            pickle.dump(data, f)
+
+    def load_data(self, filepath: str) -> Dict:
+        """
+        Loads an entire dictionary from file (with embeddings + config + sentences).
+        """
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"File not found: {filepath}")
+        with open(filepath, "rb") as f:
+            return pickle.load(f)
+
+    def load_or_create_embeddings(
+        self,
+        concepts: List[str],
+        model_name: str,
+        rating_type: str = "continuous",
+        num_phrasings: int = 3,
+        base_dir: str = "ratings",
+        openai_api_key: str = ""
+    ) -> Dict:
+        """
+        1) Constructs a filename from the config.
+        2) If that file exists, loads it.
+        3) If not, generates sentences, obtains embeddings, and saves.
+
+        Returns a dictionary:
+            {
+              'config': { ... },
+              'embeddings': np.ndarray,
+              'sentences': List[dict]
+            }
+        """
+        # Distinguish 'categorical' vs 'continuous' in the filename
+        filename_tag = "categorical" if rating_type == "categorical" else "continuous"
+        # Build the name
+        file_name = (
+            f"{model_name.replace('/','-')}_{filename_tag}"
+            f"_{len(concepts)}topics_{num_phrasings}phrasings.pkl"
+        )
+        filepath = os.path.join(base_dir, file_name)
+
+        # If it exists, load it
+        if os.path.exists(filepath):
+            print(f"Loading existing embeddings from {filepath}")
+            data = self.load_data(filepath)
+            # Also restore self.scores from the data's "scores" if needed
+            if "scores" in data["config"]:
+                self.scores = data["config"]["scores"]
+            return data
+
+        print(f"File {filepath} not found; creating embeddings from scratch...")
+
+        # Otherwise, generate everything
+        categorical = (rating_type == "categorical")
+        all_sentences = self.generate_sentences(concepts, categorical=categorical, num_phrasings=num_phrasings)
+        embeddings = self.get_embeddings(all_sentences, model_name, openai_api_key)
+
+        # Save relevant config and data
+        data = {
+            "config": {
+                "concepts": concepts,
+                "model_name": model_name,
+                "rating_type": rating_type,
+                "num_phrasings": num_phrasings,
+                "scores": self.scores,
+            },
+            "sentences": all_sentences,
+            "embeddings": embeddings,
+        }
+
+        # Save to disk
+        os.makedirs(base_dir, exist_ok=True)
+        self.save_data(data, filepath)
+        print(f"Saved new embeddings + config => {filepath}")
+        return data
+
+    ##
+    ## MDS + PLOTTING
+    ##
 
     @staticmethod
     def apply_mds(
@@ -263,42 +375,27 @@ class MDSProjector:
     ) -> np.ndarray:
         """
         Applies MDS to reduce embeddings to 2D.
-
-        Parameters
-        ----------
-        embeddings : np.ndarray of shape (N, D)
-            N data points, each D-dimensional.
-        scale : bool, default=True
-            Whether to standardize embeddings before MDS.
-        n_init : int, default=10
-            Number of times the MDS algorithm will be run with different initial solutions.
-        max_iter : int, default=1500
-            Maximum number of iterations of the MDS algorithm.
-        random_state : int, default=42
-            Determines random number generation for MDS.
-
-        Returns
-        -------
-        points_2d : np.ndarray of shape (N, 2)
-            2D projection of the input embeddings via MDS.
         """
-        # Optionally scale
         if scale:
             scaler = StandardScaler()
             embeddings = scaler.fit_transform(embeddings)
 
-        # Convert to cosine dissimilarity
-        sim_matrix = cosine_similarity(embeddings)
+        # Reduce dimensionality before computing similarities
+        pca = PCA(n_components=2)  # Keep only top 50 dimensions (adjustable)
+        embeddings_pca = pca.fit_transform(embeddings)
+
+        # Compute similarity & dissimilarity after PCA
+        sim_matrix = cosine_similarity(embeddings_pca)
         diss_matrix = 1.0 - sim_matrix
 
-        # Perform MDS
         mds = MDS(
             n_components=2,
             metric=True,
             n_init=n_init,
             max_iter=max_iter,
             random_state=random_state,
-            dissimilarity='precomputed'
+            dissimilarity='precomputed',
+            eps=1e-4,
         )
         points_2d = mds.fit_transform(diss_matrix)
         return points_2d
@@ -311,138 +408,117 @@ class MDSProjector:
         num_phrasings: int
     ) -> tuple:
         """
-        Computes MDS projections at the topic-rating-phrasing level, as well as an MDS on the
-        averaged dissimilarity matrix. Additionally, aligns each 2D projection to the first
-        using a Procrustes transformation to maintain a consistent orientation.
+        Computes MDS for each topic-phrasing block, plus an MDS of the average dissimilarity.
         """
         from tqdm import tqdm
         from scipy.spatial import procrustes
-    
+
         if embeddings.ndim != 2:
             raise ValueError("Embeddings must be 2D: (n_samples, embedding_dim).")
-    
-        embedding_dim = embeddings.shape[1]
+
         expected_size = num_topics * num_ratings * num_phrasings
         if embeddings.shape[0] != expected_size:
             raise ValueError(
                 f"Expected {expected_size} embeddings, got {embeddings.shape[0]}."
             )
-    
-        # Reshape to: (num_topics, num_ratings, num_phrasings, embedding_dim)
+
+        # Reshape
+        embedding_dim = embeddings.shape[1]
         reshaped = embeddings.reshape(num_topics, num_ratings, num_phrasings, embedding_dim)
-        # Reorder to group by (topic, phrasing) => shape = (num_phrasings*num_topics, num_ratings, embedding_dim)
+        # Reorder
         reordered = reshaped.transpose(2, 0, 1, 3).reshape(num_phrasings * num_topics, num_ratings, embedding_dim)
-    
-        # Prepare MDS
+
         mds = MDS(
             n_components=2,
             metric=True,
             n_init=10,
             max_iter=1500,
             random_state=42,
-            dissimilarity='precomputed'
+            dissimilarity='precomputed',
+            eps=0.3e-3,
+
         )
-    
+
         all_topics_points_2d = []
         all_dissimilarity_matrices = []
-    
-        # Reference for alignment
         reference_2d = None
-    
-        # Each 'block' => shape (num_ratings, embedding_dim)
+
         for block in tqdm(reordered, desc="Computing MDS for each block"):
             sim_matrix = cosine_similarity(block)
             diss_matrix = 1.0 - sim_matrix
             np.fill_diagonal(diss_matrix, 0.0)
             all_dissimilarity_matrices.append(diss_matrix)
-    
-            points_2d = mds.fit_transform(diss_matrix)  # (num_ratings, 2)
-    
-            # Align each new 2D projection to the first using Procrustes for consistent orientation
+
+            points_2d = mds.fit_transform(diss_matrix)
+
+            # Align with the reference block via Procrustes
             if reference_2d is None:
                 reference_2d = points_2d.copy()
             else:
-                _, aligned_points, _ = procrustes(reference_2d, points_2d)
-                points_2d = aligned_points
-    
+                _, aligned, _ = procrustes(reference_2d, points_2d)
+                points_2d = aligned
+
             all_topics_points_2d.append(points_2d)
-    
-        avg_dissimilarity = np.mean(all_dissimilarity_matrices, axis=0)  # (num_ratings, num_ratings)
+
+        avg_dissimilarity = np.mean(all_dissimilarity_matrices, axis=0)
         avg_points = mds.fit_transform(avg_dissimilarity)
-    
-        # Optionally align the average points as well
+        # Align average too
         _, avg_points_aligned, _ = procrustes(reference_2d, avg_points)
         avg_points = avg_points_aligned
-    
-        return all_topics_points_2d, avg_points, all_dissimilarity_matrices
-    
 
-    
+        return all_topics_points_2d, avg_points, all_dissimilarity_matrices
+
     def plot_results(
         self,
         all_topics_points_2d: List[np.ndarray],
         avg_points: np.ndarray,
         num_ratings: int,
+        num_phrasings: int,  # <---- add this
         selected_phrasings: Optional[List[int]] = None,
         categorical: bool = False
     ) -> None:
         """
-        Plots individual topic-score 2D projections and MDS of average dissimilarity matrix.
-        Connects scores with lines and color-codes dots based on score.
-    
-        Parameters
-        ----------
-        all_topics_points_2d : List[np.ndarray]
-            A list of MDS projections, each of shape (num_ratings, 2).
-        avg_points : np.ndarray
-            (num_ratings, 2) array for the average dissimilarity MDS projection.
-        num_ratings : int
-            Number of ratings per topic/phrasing block.
-        selected_phrasings : Optional[List[int]], default=None
-            List of phrasing indices (0-based) to include in the plot.
-            If None, all phrasings are plotted.
-        categorical : bool, default=False
-            If True, uses categorical labels for scores.
+        Plots each topic-score 2D projection and the average MDS projection.
         """
         import matplotlib.pyplot as plt
         from matplotlib.cm import get_cmap
         from matplotlib.colors import Normalize
-    
-        # Validate categorical labels
+
         if categorical and not hasattr(self, 'scores'):
             raise AttributeError("`self.scores` must be defined for categorical plotting.")
         
-        # Define a sequential color map
         cmap = get_cmap('viridis')
         norm = Normalize(vmin=0, vmax=len(self.scores)-1)
         colors = {score: cmap(norm(i)) for i, score in enumerate(self.scores)}
         
         plt.figure(figsize=(10, 6))
-        
-        # Default to all phrasings if none selected
-        if not selected_phrasings:
-            selected_phrasings = list(range(len(self.scores)))  # Adjust based on num_phrasings
-        
-        # Plot individual topic-score projections
+
+        # But note: we have 'all_topics_points_2d' with length (num_phrasings * num_topics)
+        # If none selected, select all
+        if selected_phrasings is None:
+            selected_phrasings = list(range(num_phrasings))
+
         for idx, points in enumerate(all_topics_points_2d):
-            phrasing_idx = idx % len(selected_phrasings)
+            phrasing_idx = idx % num_phrasings
             if phrasing_idx not in selected_phrasings:
                 continue
-            
-            # Connect points with dark grey lines
-            # plt.plot(points[:, 0], points[:, 1], color='darkgrey', linewidth=1, alpha=0.5)
-            
-            # Plot each score with corresponding color
+
+
+            # Faint connecting line between points
+            plt.plot(points[:, 0], points[:, 1], color='grey', linewidth=1, alpha=0.07)
+
+            # Plot points
             for i in range(num_ratings):
                 score = self.scores[i]
                 plt.scatter(points[i, 0], points[i, 1],
                             color=colors[score],
-                            s=50,  # Smaller size for individual points
-                            alpha=0.3,
+                            s=50,
+                            alpha=0.35,
                             edgecolors='w', linewidth=0.5)
 
-        
-        # Connect average points with lines in order of scores
+
+
+        # Connect average points
         plt.plot(avg_points[:, 0], avg_points[:, 1], color='grey', linewidth=2, linestyle='-', alpha=0.8)
         
         # Plot average dissimilarity points
@@ -450,31 +526,34 @@ class MDSProjector:
             score = self.scores[i]
             plt.scatter(avg_points[i, 0], avg_points[i, 1],
                         color=colors[score],
-                        s=150,  # Larger size for average points
+                        s=150,
                         alpha=1.0,
                         edgecolors='k', linewidth=1.5)
-            # Offset the labels to avoid overlapping the dots
+            # Label
             offset_x = 0.02 * (plt.xlim()[1] - plt.xlim()[0])
             offset_y = 0.02 * (plt.ylim()[1] - plt.ylim()[0])
-            plt.text(avg_points[i, 0] + offset_x, avg_points[i, 1] + offset_y, 
+            plt.text(avg_points[i, 0] + offset_x, avg_points[i, 1] + offset_y,
                      score if categorical else str(score),
                      fontsize=12, fontweight='bold',
                      ha='left', va='bottom', color='black',
                      bbox=dict(facecolor='white', alpha=0.85, boxstyle='round,pad=0.2'))
-        
 
-        
-        # Create custom legend for scores
+        # Legend
         from matplotlib.lines import Line2D
         legend_elements = [Line2D([0], [0], marker='o', color='w', label=score,
                                   markerfacecolor=colors[score], markersize=10)
                            for score in self.scores]
-        plt.legend(handles=legend_elements, title='Scores', loc='best')
-        
+        # plt.legend(handles=legend_elements, title='Scores', loc='best')
+
         plt.title("MDS Projection of Ratings Across Topics/Phrasings", fontsize=16)
         plt.xlabel("Dimension 1", fontsize=14)
         plt.ylabel("Dimension 2", fontsize=14)
         plt.grid(True, linestyle='--', alpha=0.5)
         plt.tight_layout()
         plt.axis('off')
+
+        # Save the plot as PNG and SVG
+        plt.savefig("outputs/mds_projection_categorical_v1.png", dpi=300, bbox_inches='tight', format='png')  # High-resolution PNG
+        plt.savefig("outputs/mds_projection_categorical_v1.svg", bbox_inches='tight', format='svg')  # Vector-format SVG
+
         plt.show()
